@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:www.blogs.uni-mainz.de)",
+      "WebFetch(domain:www.crewes.org)",
+      "Bash(uv run:*)"
+    ]
+  }
+}
