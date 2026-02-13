@@ -26,10 +26,10 @@ MODEL_CONFIG = {
 }
 
 TRAIN_CONFIG = {
-    "n_epochs": 2000,
+    "n_epochs": 200,
     "lr": 1e-3,
     "target_pos": (0.05, 0.05),
-    "save_interval": 500,
+    "save_interval": 100,
     "output_dir": "output",
 }
 

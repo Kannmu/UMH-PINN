@@ -52,7 +52,8 @@ def compute_loss(
     target_mask = torch.exp(-dist_sq / (2 * sigma ** 2)).to(device=device, dtype=dtype)
     off_mask = 1.0 - target_mask
 
-    mip_map = torch.amax(stress_history, dim=0)
+    beta = 1000.0
+    mip_map = torch.logsumexp(stress_history * beta, dim=0) / beta
 
     signal = (mip_map * target_mask).sum() / (target_mask.sum() + eps)
 
