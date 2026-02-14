@@ -1,9 +1,10 @@
 """
-Spatiotemporal Contrast Loss for PINN-based Inverse Design
+Spatiotemporal Pulse-Focused Loss for PINN-based Inverse Design.
 
 Core idea:
-1) Maximum Intensity Projection (MIP) over time.
-2) Maximize contrast between target region and off-target region.
+1) Temporal concentration at a desired pulse time.
+2) Spatial silence off-target over the full time window.
+3) Energy efficiency with pre-pulse suppression.
 """
 
 import torch
@@ -22,19 +23,12 @@ def compute_loss(
     **kwargs,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
-    Compute spatiotemporal contrast loss.
+    Compute spatiotemporal pulse-focused loss.
 
-    Args:
-        wave_output: Dict from physics layer with 'stress_history'
-        trajectory: [n_steps, 2] tensor of (x, y) coordinates in meters
-        target_pos: (x_target, y_target) in meters
-        physics_engine: ViscoelasticWave2D instance for interpolation
-        target_radius: Radius of target region in meters
-        weights: Optional dict of loss weights
-
-    Returns:
-        total_loss: Scalar loss tensor
-        loss_dict: Dict of individual loss components for logging
+    Core objectives:
+    1) Temporal concentration at a desired pulse time.
+    2) Spatial silence off-target over the full time window.
+    3) Energy efficiency (high peak with low total energy).
     """
     if weights is None:
         weights = config.LOSS_WEIGHTS
@@ -52,17 +46,59 @@ def compute_loss(
     target_mask = torch.exp(-dist_sq / (2 * sigma ** 2)).to(device=device, dtype=dtype)
     off_mask = 1.0 - target_mask
 
-    beta = 1000.0
-    mip_map = torch.logsumexp(stress_history * beta, dim=0) / beta
+    mask_sum = target_mask.sum() + eps
+    target_trace = (stress_history * target_mask).sum(dim=(1, 2)) / mask_sum
 
-    signal = (mip_map * target_mask).sum() / (target_mask.sum() + eps)
+    n_steps = stress_history.shape[0]
+    dt = getattr(physics_engine, "dt", 1.0)
+    time = torch.arange(n_steps, device=device, dtype=dtype) * dt
 
-    p = 6.0
-    noise_power = ((mip_map * off_mask).abs() ** p).sum()
-    noise_norm = (off_mask.abs() ** p).sum() + eps
-    noise = (noise_power / noise_norm).pow(1.0 / p)
+    freq_cfg = getattr(config, "LOSS_FREQ_CONFIG", {})
+    target_hz = kwargs.get("target_hz", freq_cfg.get("target_hz", 200.0))
+    sigma_hz = kwargs.get("sigma_hz", freq_cfg.get("sigma_hz", 25.0))
+    min_cycles = kwargs.get("min_cycles", freq_cfg.get("min_cycles", 2))
+    target_hz = torch.tensor(target_hz, device=device, dtype=dtype)
+    sigma_hz = torch.tensor(sigma_hz, device=device, dtype=dtype)
+    min_cycles = torch.tensor(min_cycles, device=device, dtype=dtype)
 
-    contrast_loss = noise / (signal + eps)
+    target_trace_detrend = target_trace - target_trace.mean()
+    window = torch.hann_window(n_steps, device=device, dtype=dtype)
+    fft_vals = torch.fft.rfft(target_trace_detrend * window)
+    fft_mag = fft_vals.abs() + eps
+    freqs = torch.fft.rfftfreq(n_steps, d=dt).to(device=device, dtype=dtype)
+    target_weight = torch.exp(-0.5 * ((freqs - target_hz) / (sigma_hz + eps)) ** 2)
+    off_weight = 1.0 - target_weight
+    target_band_power = (fft_mag * target_weight).sum() / (target_weight.sum() + eps)
+    off_band_power = (fft_mag * off_weight).sum() / (off_weight.sum() + eps)
+    cycles = target_hz * n_steps * dt
+    cycle_weight = torch.clamp(cycles / (min_cycles + eps), 0.0, 1.0)
+    frequency_loss = cycle_weight * (off_band_power / (target_band_power + eps))
+
+    t_peak = kwargs.get("pulse_t_peak", 0.5 * (n_steps - 1) * dt)
+    sigma_t = kwargs.get("pulse_sigma", 0.08 * n_steps * dt)
+    t_peak = torch.tensor(t_peak, device=device, dtype=dtype)
+    sigma_t = torch.tensor(sigma_t, device=device, dtype=dtype)
+
+    pulse_window = torch.exp(-0.5 * ((time - t_peak) / (sigma_t + eps)) ** 2)
+    target_peak = (target_trace * pulse_window).sum() / (pulse_window.sum() + eps)
+    pulse_loss = -target_peak
+
+    pre_mask = time < (t_peak - 2.0 * sigma_t)
+    if pre_mask.any():
+        pre_pulse = (target_trace[pre_mask] ** 2).mean()
+    else:
+        pre_pulse = torch.zeros((), device=device, dtype=dtype)
+
+    time_weight = torch.sigmoid((time - (t_peak - sigma_t)) / (sigma_t / 2.0 + eps))
+    silence_loss = ((stress_history * off_mask * time_weight[:, None, None]) ** 2).mean()
+    total_energy = (stress_history ** 2).mean()
+    efficiency_loss = total_energy / (target_peak ** 2 + eps)
+
+    contrast_ratio = kwargs.get("contrast_ratio", config.LOSS_CONTRAST_RATIO)
+    contrast_ratio = torch.tensor(contrast_ratio, device=device, dtype=dtype)
+    spatial_max_stress = stress_history.max(dim=0).values
+    sidelobe_peak = (spatial_max_stress * off_mask).max()
+    contrast_loss = torch.relu(sidelobe_peak - target_peak * contrast_ratio)
 
     trajectory_diff = trajectory[1:] - trajectory[:-1]
     step_lengths = torch.sqrt((trajectory_diff ** 2).sum(dim=-1) + eps)
@@ -75,22 +111,84 @@ def compute_loss(
         jerk_vec = acceleration[1:] - acceleration[:-1]
         jerk = (jerk_vec ** 2).sum()
 
-    weighted_contrast = weights.get("contrast", 1.0) * contrast_loss
+    traj_cfg = getattr(config, "TRAJ_CONSTRAINT_CONFIG", {})
+    soft_target_radius = torch.tensor(
+        kwargs.get("traj_target_radius", traj_cfg.get("target_radius", 0.03)),
+        device=device,
+        dtype=dtype,
+    )
+    boundary_margin = torch.tensor(
+        kwargs.get("traj_boundary_margin", traj_cfg.get("boundary_margin", 0.005)),
+        device=device,
+        dtype=dtype,
+    )
+    softplus_beta = kwargs.get("traj_softplus_beta", traj_cfg.get("softplus_beta", 50.0))
+
+    x = trajectory[:, 0]
+    y = trajectory[:, 1]
+    x_min = boundary_margin
+    y_min = boundary_margin
+    x_max = torch.tensor(physics_engine.Lx, device=device, dtype=dtype) - boundary_margin
+    y_max = torch.tensor(physics_engine.Ly, device=device, dtype=dtype) - boundary_margin
+
+    center = torch.tensor([physics_engine.Lx, physics_engine.Ly], device=device, dtype=dtype) / 2.0
+    radial_dist = torch.sqrt(((trajectory - center) ** 2).sum(dim=-1) + eps)
+    radial_violation = torch.relu(radial_dist - soft_target_radius)
+
+    bound_violation = (
+        torch.relu(x_min - x)
+        + torch.relu(x - x_max)
+        + torch.relu(y_min - y)
+        + torch.relu(y - y_max)
+    )
+
+    trajectory_region_loss = (
+        torch.nn.functional.softplus(radial_violation, beta=softplus_beta).mean()
+        + torch.nn.functional.softplus(bound_violation, beta=softplus_beta).mean()
+    )
+
+    weighted_pulse = weights.get("pulse", 1.0) * pulse_loss
+    weighted_silence = weights.get("silence", 1.0) * silence_loss
+    weighted_contrast = weights.get("contrast", 0.0) * contrast_loss
+    weighted_efficiency = weights.get("efficiency", 1.0) * efficiency_loss
+    weighted_pre_pulse = weights.get("pre_pulse", 1.0) * pre_pulse
     weighted_trajectory_length = weights.get("trajectory_length", 0.0) * trajectory_length
     weighted_jerk = weights.get("jerk", 0.0) * jerk
+    weighted_frequency = weights.get("frequency", 0.0) * frequency_loss
+    weighted_trajectory_region = weights.get("trajectory_region", 0.0) * trajectory_region_loss
 
-    total_loss = weighted_contrast + weighted_trajectory_length + weighted_jerk
+    total_loss = (
+        weighted_pulse
+        + weighted_silence
+        + weighted_contrast
+        + weighted_efficiency
+        + weighted_pre_pulse
+        + weighted_trajectory_length
+        + weighted_jerk
+        + weighted_frequency
+        + weighted_trajectory_region
+    )
 
     loss_dict = {
         "total": total_loss.item(),
+        "pulse": weighted_pulse.item(),
+        "silence": weighted_silence.item(),
         "contrast": weighted_contrast.item(),
-        "signal": signal.item(),
-        "noise": noise.item(),
-        "snr": (signal / (noise + eps)).item(),
+        "efficiency": weighted_efficiency.item(),
+        "pre_pulse": weighted_pre_pulse.item(),
+        "frequency": weighted_frequency.item(),
+        "frequency_loss": frequency_loss.item(),
+        "target_peak": target_peak.item(),
+        "sidelobe_peak": sidelobe_peak.item(),
+        "total_energy": total_energy.item(),
         "trajectory_length": trajectory_length.item(),
         "trajectory_penalty": weighted_trajectory_length.item(),
         "jerk": jerk.item(),
         "jerk_penalty": weighted_jerk.item(),
+        "trajectory_region": trajectory_region_loss.item(),
+        "trajectory_region_penalty": weighted_trajectory_region.item(),
+        "target_band_power": target_band_power.item(),
+        "off_band_power": off_band_power.item(),
     }
 
     return total_loss, loss_dict

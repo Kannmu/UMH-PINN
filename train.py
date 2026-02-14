@@ -86,12 +86,20 @@ def train(
     # Training history
     history = {
         'total': [],
+        'pulse': [],
+        'silence': [],
         'contrast': [],
-        'signal': [],
-        'noise': [],
-        'snr': [],
+        'efficiency': [],
+        'pre_pulse': [],
+        'target_peak': [],
+        'sidelobe_peak': [],
+        'total_energy': [],
         'trajectory_length': [],
         'jerk': [],
+        'frequency': [],
+        'frequency_loss': [],
+        'target_band_power': [],
+        'off_band_power': [],
     }
 
     print(f"\nStarting training for {n_epochs} epochs...")
@@ -121,10 +129,21 @@ def train(
             wave_output = physics(trajectory)
 
             # Compute loss
+            pulse_cfg = getattr(config, "LOSS_PULSE_CONFIG", {})
+            n_steps = physics.n_steps
+            dt = physics.dt
+            t_peak = pulse_cfg.get("t_peak_fraction", 0.5) * (n_steps - 1) * dt
+            sigma_t = pulse_cfg.get("sigma_fraction", 0.08) * n_steps * dt
+            freq_cfg = getattr(config, "LOSS_FREQ_CONFIG", {})
             loss, loss_dict = compute_loss(
                 wave_output, trajectory, target_pos, physics,
                 target_radius=config.LOSS_TARGET_RADIUS,
                 weights=loss_weights,
+                pulse_t_peak=t_peak,
+                pulse_sigma=sigma_t,
+                target_hz=freq_cfg.get("target_hz", 200.0),
+                sigma_hz=freq_cfg.get("sigma_hz", 25.0),
+                min_cycles=freq_cfg.get("min_cycles", 2),
             )
 
             if csv_writer is None:
@@ -157,9 +176,9 @@ def train(
             # Update progress bar
             pbar.set_postfix({
                 'loss': f'{loss_dict["total"]:.4f}',
-                'snr': f'{loss_dict["snr"]:.3f}',
+                'pulse': f'{loss_dict["pulse"]:.4f}',
+                'silence': f'{loss_dict["silence"]:.4f}',
                 'traj_len': f'{loss_dict["trajectory_length"]:.4f}',
-                'jerk': f'{loss_dict["jerk"]:.4f}',
             })
 
             # Check for NaN
@@ -172,19 +191,23 @@ def train(
             # Log
             if epoch % 10 == 0:
                 if epoch == 0:
-                    header = f"{'Epoch':^6} | {'Total':^10} | {'Contrast':^10} | {'Signal':^10} | {'Noise':^10} | {'TrajLen':^10} | {'Jerk':^10} | {'SNR':^10}"
+                    header = (
+                        f"{'Epoch':^6} | {'Total':^10} | {'Pulse':^10} | {'Silence':^10} | "
+                        f"{'Eff':^10} | {'Pre':^10} | {'Peak':^10} | {'TrajLen':^10} | {'Jerk':^10}"
+                    )
                     tqdm.write(header)
                     tqdm.write("-" * len(header))
 
                 log_str = (
                     f"{epoch:^6d} | "
                     f"{loss_dict['total']:^10.4f} | "
-                    f"{loss_dict['contrast']:^10.4f} | "
-                    f"{loss_dict['signal']:^10.4f} | "
-                    f"{loss_dict['noise']:^10.4f} | "
+                    f"{loss_dict['pulse']:^10.4f} | "
+                    f"{loss_dict['silence']:^10.4f} | "
+                    f"{loss_dict['efficiency']:^10.4f} | "
+                    f"{loss_dict['pre_pulse']:^10.4f} | "
+                    f"{loss_dict['target_peak']:^10.4f} | "
                     f"{loss_dict['trajectory_length']:^10.4f} | "
-                    f"{loss_dict['jerk']:^10.4f} | "
-                    f"{loss_dict['snr']:^10.3f}"
+                    f"{loss_dict['jerk']:^10.4f}"
                 )
                 tqdm.write(log_str)
 
