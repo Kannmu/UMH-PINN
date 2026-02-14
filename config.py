@@ -3,72 +3,34 @@ SEED = 42
 PHYSICS_CONFIG = {
     "Lx": 0.1,
     "Ly": 0.1,
-    "Lz": 0.02,
     "nx": 100,
     "ny": 100,
-    "nz": 20,
-    "dt": 1.25e-5,
-    "n_steps": 400,
+    "dt": 25e-6,
+    "n_steps": 200,
     "sim_cycles": 3,
-    "bulk_damping": 60.0,
-    "source_sigma_xy": 0.0025,
-    "source_sigma_z": 0.0012,
-    "source_depth": 0.0015,
-    "n_pml": 8,
-    "max_damping": 0.35,
-    "layers": [
-        {
-            "name": "epidermis",
-            "z_max": 0.001,
-            "rho": 1150.0,
-            "vp": 30.0,
-            "vs": 12.0,
-            "eta": 8.0,
-        },
-        {
-            "name": "dermis",
-            "z_max": 0.003,
-            "rho": 1100.0,
-            "vp": 20.0,
-            "vs": 6.5,
-            "eta": 6.0,
-        },
-        {
-            "name": "fat",
-            "z_max": 0.010,
-            "rho": 950.0,
-            "vp": 12.0,
-            "vs": 3.5,
-            "eta": 4.0,
-        },
-        {
-            "name": "muscle",
-            "z_max": 0.020,
-            "rho": 1050.0,
-            "vp": 24.0,
-            "vs": 8.0,
-            "eta": 7.0,
-        },
-    ],
+    "rho": 1000.0,
+    "cs": 5.0,
+    "eta": 2.0,
+    "bulk_damping": 250.0,
+    "source_sigma": 0.0036,
+    "n_pml": 5,
+    "max_damping": 0.5,
 }
 
 MODEL_CONFIG = {
     "n_steps": 200,
     "n_control_points": 16,
     "hidden_dim": 128,
-    "num_layers": 5,
+    "num_layers": 4,
     "latent_dim": 16,
 }
 
 TRAIN_CONFIG = {
-    "n_epochs": 1000,
+    "n_epochs": 200,
     "lr": 1e-3,
     "target_pos": (0.05, 0.05),
-    "save_interval": 200,
+    "save_interval": 100,
     "output_dir": "output",
-    "compile": False,
-    "use_tf32": True,
-    "batch_size": 1,
 }
 
 LOSS_WEIGHTS = {
@@ -90,5 +52,4 @@ VISUAL_CONFIG = {
     "cm_scale": 100,
     "plot_xlim_cm": 10,
     "plot_ylim_cm": 10,
-    "z_slice_index": 1,
 }

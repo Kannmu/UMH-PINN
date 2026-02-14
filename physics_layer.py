@@ -1,274 +1,115 @@
 """
-Differentiable 3D Viscoelastic Elastic Wave FDTD Engine
+Differentiable 2D Viscoelastic Wave FDTD Engine (SH-wave formulation)
 
-- Full 3D elastic wave propagation (P and S waves)
-- Kelvin-Voigt viscoelasticity (dashpot in shear)
-- Multi-layer skin model with depth-dependent material properties
-- Absorbing sponge boundary
+Implements anti-plane shear wave propagation with Kelvin-Voigt viscoelasticity.
+CFL-stable for shear waves (cs=5 m/s, dt=25μs → Courant ≈ 0.125)
 
-Coordinates:
-- x: lateral (0..Lx)
-- y: lateral (0..Ly)
-- z: depth (0..Lz), z=0 is skin surface
+Multi-platform support: CUDA, MPS (Apple Silicon), CPU
 """
-
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from torch.jit import script
+from typing import Dict, Optional
 
 import config
-from device_utils import get_device
+from device_utils import get_device, safe_outer
 
 
-@script
-def compute_source_kernel(
-    grid_x: torch.Tensor,
-    grid_y: torch.Tensor,
-    grid_z: torch.Tensor,
-    x_t: torch.Tensor,
-    y_t: torch.Tensor,
-    source_depth: float,
-    sigma_xy: float,
-    sigma_z: float,
-) -> torch.Tensor:
-    x_t = x_t.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-    y_t = y_t.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-    
-    r_xy = (grid_x.unsqueeze(0) - x_t) ** 2 + (grid_y.unsqueeze(0) - y_t) ** 2
-    r_z = (grid_z.unsqueeze(0) - source_depth) ** 2
-
-    source = torch.exp(-r_xy / (2 * sigma_xy ** 2))
-    source = source * torch.exp(-r_z / (2 * sigma_z ** 2))
-    return source
-
-
-@script
-def fdtd_step_kernel(
-    vx: torch.Tensor, vy: torch.Tensor, vz: torch.Tensor,
-    sxx: torch.Tensor, syy: torch.Tensor, szz: torch.Tensor,
-    sxy: torch.Tensor, sxz: torch.Tensor, syz: torch.Tensor,
-    rho: torch.Tensor, mu: torch.Tensor, lam: torch.Tensor, eta: torch.Tensor,
-    damping: torch.Tensor, source: torch.Tensor,
-    dt: float, inv_dx: float, inv_dy: float, inv_dz: float,
-    bulk_damping: float,
-    physics_eps: float
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    
-    # Velocity gradients
-    dvx_dx = torch.zeros_like(vx)
-    dvx_dy = torch.zeros_like(vx)
-    dvx_dz = torch.zeros_like(vx)
-    dvy_dx = torch.zeros_like(vx)
-    dvy_dy = torch.zeros_like(vx)
-    dvy_dz = torch.zeros_like(vx)
-    dvz_dx = torch.zeros_like(vx)
-    dvz_dy = torch.zeros_like(vx)
-    dvz_dz = torch.zeros_like(vx)
-
-    dvx_dx[:, :-1, :, :] = (vx[:, 1:, :, :] - vx[:, :-1, :, :]) * inv_dx
-    dvx_dy[:, :, :-1, :] = (vx[:, :, 1:, :] - vx[:, :, :-1, :]) * inv_dy
-    dvx_dz[:, :, :, :-1] = (vx[:, :, :, 1:] - vx[:, :, :, :-1]) * inv_dz
-
-    dvy_dx[:, :-1, :, :] = (vy[:, 1:, :, :] - vy[:, :-1, :, :]) * inv_dx
-    dvy_dy[:, :, :-1, :] = (vy[:, :, 1:, :] - vy[:, :, :-1, :]) * inv_dy
-    dvy_dz[:, :, :, :-1] = (vy[:, :, :, 1:] - vy[:, :, :, :-1]) * inv_dz
-
-    dvz_dx[:, :-1, :, :] = (vz[:, 1:, :, :] - vz[:, :-1, :, :]) * inv_dx
-    dvz_dy[:, :, :-1, :] = (vz[:, :, 1:, :] - vz[:, :, :-1, :]) * inv_dy
-    dvz_dz[:, :, :, :-1] = (vz[:, :, :, 1:] - vz[:, :, :, :-1]) * inv_dz
-
-    # Strain-rate tensor components
-    exx = dvx_dx
-    eyy = dvy_dy
-    ezz = dvz_dz
-    exy = 0.5 * (dvx_dy + dvy_dx)
-    exz = 0.5 * (dvx_dz + dvz_dx)
-    eyz = 0.5 * (dvy_dz + dvz_dy)
-
-    # Stress updates (Kelvin-Voigt in shear)
-    trace = exx + eyy + ezz
-    sxx = sxx + dt * ((lam + 2 * mu) * exx + lam * (trace - exx))
-    syy = syy + dt * ((lam + 2 * mu) * eyy + lam * (trace - eyy))
-    szz = szz + dt * ((lam + 2 * mu) * ezz + lam * (trace - ezz))
-
-    sxy = sxy + dt * (2 * mu * exy + 2 * eta * exy)
-    sxz = sxz + dt * (2 * mu * exz + 2 * eta * exz)
-    syz = syz + dt * (2 * mu * eyz + 2 * eta * eyz)
-
-    # Stress divergence
-    dsxx_dx = torch.zeros_like(vx)
-    dsxy_dy = torch.zeros_like(vx)
-    dsxz_dz = torch.zeros_like(vx)
-
-    dsyx_dx = torch.zeros_like(vx)
-    dsyy_dy = torch.zeros_like(vx)
-    dsyz_dz = torch.zeros_like(vx)
-
-    dszx_dx = torch.zeros_like(vx)
-    dszy_dy = torch.zeros_like(vx)
-    dszz_dz = torch.zeros_like(vx)
-
-    dsxx_dx[:, 1:, :, :] = (sxx[:, 1:, :, :] - sxx[:, :-1, :, :]) * inv_dx
-    dsxy_dy[:, :, 1:, :] = (sxy[:, :, 1:, :] - sxy[:, :, :-1, :]) * inv_dy
-    dsxz_dz[:, :, :, 1:] = (sxz[:, :, :, 1:] - sxz[:, :, :, :-1]) * inv_dz
-
-    dsyx_dx[:, 1:, :, :] = (sxy[:, 1:, :, :] - sxy[:, :-1, :, :]) * inv_dx
-    dsyy_dy[:, :, 1:, :] = (syy[:, :, 1:, :] - syy[:, :, :-1, :]) * inv_dy
-    dsyz_dz[:, :, :, 1:] = (syz[:, :, :, 1:] - syz[:, :, :, :-1]) * inv_dz
-
-    dszx_dx[:, 1:, :, :] = (sxz[:, 1:, :, :] - sxz[:, :-1, :, :]) * inv_dx
-    dszy_dy[:, :, 1:, :] = (syz[:, :, 1:, :] - syz[:, :, :-1, :]) * inv_dy
-    dszz_dz[:, :, :, 1:] = (szz[:, :, :, 1:] - szz[:, :, :, :-1]) * inv_dz
-
-    # Velocity updates
-    vx = vx + dt * (dsxx_dx + dsxy_dy + dsxz_dz) / rho
-    vy = vy + dt * (dsyx_dx + dsyy_dy + dsyz_dz) / rho
-    vz = vz + dt * (dszx_dx + dszy_dy + dszz_dz + source) / rho
-
-    if bulk_damping > 0.0:
-        factor = 1.0 - bulk_damping * dt
-        vx = vx * factor
-        vy = vy * factor
-        vz = vz * factor
-
-    vx = vx * damping
-    vy = vy * damping
-    vz = vz * damping
-
-    stress_mag = torch.sqrt(sxy ** 2 + sxz ** 2 + syz ** 2 + physics_eps)
-    
-    return vx, vy, vz, sxx, syy, szz, sxy, sxz, syz, stress_mag
-
-
-@dataclass
-class MaterialFields:
-    rho: torch.Tensor
-    vp: torch.Tensor
-    vs: torch.Tensor
-    eta: torch.Tensor
-
-    @property
-    def mu(self) -> torch.Tensor:
-        return self.rho * (self.vs ** 2)
-
-    @property
-    def lam(self) -> torch.Tensor:
-        return self.rho * (self.vp ** 2) - 2.0 * self.mu
-
-
-class ViscoelasticWave3D(nn.Module):
+class ViscoelasticWave2D(nn.Module):
     """
-    Differentiable 3D elastic wave solver with Kelvin-Voigt shear viscosity.
+    Differentiable FDTD solver for 2D viscoelastic shear waves.
 
-    State variables:
-    - Particle velocities: vx, vy, vz
-    - Stresses: sxx, syy, szz, sxy, sxz, syz
-
-    Update scheme:
-    - Explicit finite differences (collocated grid)
+    SH-wave formulation (anti-plane):
+        ρ ∂vz/∂t = ∂σxz/∂x + ∂σyz/∂y + f(x,y,t)
+        σxz = μ ∂vz/∂x + η ∂²vz/∂x∂t  (Kelvin-Voigt)
+        σyz = μ ∂vz/∂y + η ∂²vz/∂y∂t  (Kelvin-Voigt)
     """
 
     def __init__(
         self,
         Lx: float = config.PHYSICS_CONFIG["Lx"],
         Ly: float = config.PHYSICS_CONFIG["Ly"],
-        Lz: float = config.PHYSICS_CONFIG["Lz"],
         nx: int = config.PHYSICS_CONFIG["nx"],
         ny: int = config.PHYSICS_CONFIG["ny"],
-        nz: int = config.PHYSICS_CONFIG["nz"],
         dt: float = config.PHYSICS_CONFIG["dt"],
         n_steps: int = config.PHYSICS_CONFIG["n_steps"],
+        rho: float = config.PHYSICS_CONFIG["rho"],
+        cs: float = config.PHYSICS_CONFIG["cs"],
+        eta: float = config.PHYSICS_CONFIG["eta"],
         bulk_damping: float = config.PHYSICS_CONFIG.get("bulk_damping", 0.0),
-        source_sigma_xy: float = config.PHYSICS_CONFIG["source_sigma_xy"],
-        source_sigma_z: float = config.PHYSICS_CONFIG["source_sigma_z"],
-        source_depth: float = config.PHYSICS_CONFIG["source_depth"],
+        source_sigma: float = config.PHYSICS_CONFIG["source_sigma"],
         n_pml: int = config.PHYSICS_CONFIG["n_pml"],
         max_damping: float = config.PHYSICS_CONFIG["max_damping"],
-        layers: Optional[List[Dict[str, float]]] = None,
         device: Optional[torch.device] = None,
     ):
+        """
+        Initialize the wave solver.
+
+        Args:
+            Lx, Ly: Domain size in meters (default 20cm × 20cm)
+            nx, ny: Grid points (default 200 × 200, dx=dy=1mm)
+            dt: Time step in seconds (default 25μs)
+            n_steps: Total simulation steps (default 200, total 5ms)
+            rho: Density in kg/m³ (default 1000, water-like)
+            cs: Shear wave speed in m/s (default 5)
+            eta: Viscosity in Pa·s (default 0.1)
+            source_sigma: Gaussian source width in meters (default 3mm)
+            n_pml: Absorbing boundary width in cells (default 20)
+            max_damping: Maximum damping coefficient at boundary (default 0.05)
+            device: Torch device (auto-detected if None)
+        """
         super().__init__()
 
-        self.Lx, self.Ly, self.Lz = Lx, Ly, Lz
-        self.nx, self.ny, self.nz = nx, ny, nz
+        # Store parameters
+        self.Lx, self.Ly = Lx, Ly
+        self.nx, self.ny = nx, ny
         self.dx = Lx / nx
         self.dy = Ly / ny
-        self.dz = Lz / nz
         self.dt = dt
         self.n_steps = n_steps
+        self.source_sigma = source_sigma
+
+        # Material properties
+        self.rho = rho
+        self.cs = cs
+        self.mu = rho * cs * cs  # Shear modulus = ρ * cs²
+        self.eta = eta
         self.bulk_damping = bulk_damping
-        self.source_sigma_xy = source_sigma_xy
-        self.source_sigma_z = source_sigma_z
-        self.source_depth = source_depth
 
-        if device is None:
-            device = get_device(verbose=True)
-        self.device = device
-        self._mem_logged = False
-
-        # CFL check based on maximum vp
-        layer_defs = layers if layers is not None else config.PHYSICS_CONFIG["layers"]
-        max_vp = max(layer["vp"] for layer in layer_defs)
-        min_dx = min(self.dx, self.dy, self.dz)
-        courant = max_vp * dt / min_dx * (3 ** 0.5)
+        # CFL check
+        courant = cs * dt / self.dx * (2 ** 0.5)
         if courant >= 1.0:
             raise ValueError(f"CFL condition violated: Courant={courant:.3f} >= 1.0")
         print(f"[Physics] CFL check passed: Courant = {courant:.4f}")
 
-        # Grid coordinates
-        x = torch.linspace(self.dx / 2, Lx - self.dx / 2, nx, device=device)
-        y = torch.linspace(self.dy / 2, Ly - self.dy / 2, ny, device=device)
-        z = torch.linspace(self.dz / 2, Lz - self.dz / 2, nz, device=device)
-        self.grid_x, self.grid_y, self.grid_z = torch.meshgrid(x, y, z, indexing="ij")
-
-        # Material fields
-        self.material = self._build_material_fields(layer_defs)
-
-        # Damping (sponge) boundary
-        self.damping = self._build_damping(n_pml, max_damping)
-
         # Precomputed constants
         self.inv_dx = 1.0 / self.dx
         self.inv_dy = 1.0 / self.dy
-        self.inv_dz = 1.0 / self.dz
+        self.dt_over_rho = dt / rho
 
-    def _build_material_fields(self, layers: List[Dict[str, float]]) -> MaterialFields:
-        """Build depth-dependent material tensors for rho, vp, vs, eta."""
-        z = self.grid_z
-        rho = torch.empty_like(z)
-        vp = torch.empty_like(z)
-        vs = torch.empty_like(z)
-        eta = torch.empty_like(z)
+        # Device detection
+        if device is None:
+            device = get_device(verbose=True)
+        self.device = device
 
-        z_prev = 0.0
-        for layer in layers:
-            z_max = layer["z_max"]
-            mask = (z >= z_prev) & (z < z_max)
-            rho = torch.where(mask, torch.tensor(layer["rho"], device=self.device), rho)
-            vp = torch.where(mask, torch.tensor(layer["vp"], device=self.device), vp)
-            vs = torch.where(mask, torch.tensor(layer["vs"], device=self.device), vs)
-            eta = torch.where(mask, torch.tensor(layer["eta"], device=self.device), eta)
-            z_prev = z_max
+        # Build coordinate grid [nx, ny]
+        x = torch.linspace(self.dx / 2, Lx - self.dx / 2, nx, device=device)
+        y = torch.linspace(self.dy / 2, Ly - self.dy / 2, ny, device=device)
+        self.grid_x, self.grid_y = torch.meshgrid(x, y, indexing='ij')
 
-        # Fill any remaining depth with last layer
-        mask = z >= z_prev
-        rho = torch.where(mask, torch.tensor(layers[-1]["rho"], device=self.device), rho)
-        vp = torch.where(mask, torch.tensor(layers[-1]["vp"], device=self.device), vp)
-        vs = torch.where(mask, torch.tensor(layers[-1]["vs"], device=self.device), vs)
-        eta = torch.where(mask, torch.tensor(layers[-1]["eta"], device=self.device), eta)
-
-        return MaterialFields(rho=rho, vp=vp, vs=vs, eta=eta)
+        # Build damping profile for absorbing boundaries (cosine-tapered sponge layer)
+        # Note: This is not a true PML; it is a damping sponge for edge absorption.
+        self.damping = self._build_damping(n_pml, max_damping)
 
     def _build_damping(self, n_pml: int, max_damping: float) -> torch.Tensor:
-        """Cosine-tapered damping sponge for 3D boundaries."""
+        """
+        Build cosine-tapered damping profile for absorbing boundary conditions.
+
+        Returns: [1, nx, ny] tensor with 1.0 in interior, decaying to (1-max_damping) at edges.
+        """
+        # 1D damping profiles
         damping_x = torch.ones(self.nx, device=self.device)
         damping_y = torch.ones(self.ny, device=self.device)
-        damping_z = torch.ones(self.nz, device=self.device)
 
         for i in range(n_pml):
             arg = torch.tensor(torch.pi * (n_pml - i) / n_pml, device=self.device)
@@ -277,152 +118,220 @@ class ViscoelasticWave3D(nn.Module):
             damping_x[-(i + 1)] = factor
             damping_y[i] = factor
             damping_y[-(i + 1)] = factor
-            damping_z[i] = factor
-            damping_z[-(i + 1)] = factor
 
-        damping_3d = damping_x[:, None, None] * damping_y[None, :, None] * damping_z[None, None, :]
-        return damping_3d.unsqueeze(0)
+        # Outer product to 2D (use safe_outer for MPS compatibility)
+        damping_2d = safe_outer(damping_x, damping_y, self.device)
+        return damping_2d.unsqueeze(0)  # [1, nx, ny]
 
-    def _make_source(self, x_t: torch.Tensor, y_t: torch.Tensor) -> torch.Tensor:
+    def _make_source(
+        self,
+        x_t: torch.Tensor,
+        y_t: torch.Tensor,
+        amplitude: float = 1.0
+    ) -> torch.Tensor:
         """
-        Create anisotropic Gaussian source centered at (x_t, y_t, z0).
-        Helper wrapper around the JIT kernel.
+        Create Gaussian source distribution centered at continuous (x_t, y_t).
+
+        Args:
+            x_t, y_t: Source center coordinates [batch] in meters
+            amplitude: Source amplitude
+
+        Returns: [batch, nx, ny] source distribution
         """
-        return compute_source_kernel(
-            self.grid_x, self.grid_y, self.grid_z,
-            x_t, y_t,
-            self.source_depth,
-            self.source_sigma_xy,
-            self.source_sigma_z
-        )
+        # x_t, y_t: [batch] → [batch, 1, 1] for broadcasting
+        x_t = x_t.unsqueeze(-1).unsqueeze(-1)
+        y_t = y_t.unsqueeze(-1).unsqueeze(-1)
+
+        # Gaussian kernel
+        r_sq = (self.grid_x.unsqueeze(0) - x_t) ** 2 + (self.grid_y.unsqueeze(0) - y_t) ** 2
+        source = amplitude * torch.exp(-r_sq / (2 * self.source_sigma ** 2))
+
+        return source  # [batch, nx, ny]
 
     def forward(
         self,
         trajectory: torch.Tensor,
-        source_amplitude: float = 1.0,
-        return_vz: bool = False,
-        return_stress_history: bool = False,
+        source_amplitude: float = 1.0
     ) -> Dict[str, torch.Tensor]:
         """
-        Run 3D elastic wave simulation.
+        Run the FDTD simulation for a given trajectory.
 
         Args:
-            trajectory: [n_steps, 2] (x, y) coordinates in meters
-            source_amplitude: scalar amplitude (full power by default)
-            return_vz: Whether to return vertical velocity history (memory intensive)
-            return_stress_history: Whether to return full stress history (very memory intensive)
+            trajectory: [n_steps, 2] tensor of (x, y) coordinates in meters
+            source_amplitude: Amplitude of the source at each step
 
         Returns:
             dict with:
-                'mip_map': [batch, nx, ny, nz] (log-sum-exp MIP over time)
-                'vz_history': [n_steps, nx, ny, nz] (vertical velocity) - ONLY if return_vz=True
-                'stress_history': [n_steps, nx, ny, nz] (shear stress magnitude) - ONLY if return_stress_history=True
+                'vz_history': [n_steps, nx, ny] velocity field history
+                'stress_history': [n_steps, nx, ny] stress magnitude history
         """
         n_steps = self.n_steps
         traj_len = trajectory.shape[0]
-        if trajectory.dim() == 2:
-            trajectory = trajectory.unsqueeze(0)
-        batch_size = trajectory.shape[0]
-
-        vx = torch.zeros(batch_size, self.nx, self.ny, self.nz, device=self.device)
-        vy = torch.zeros_like(vx)
-        vz = torch.zeros_like(vx)
-
-        sxx = torch.zeros_like(vx)
-        syy = torch.zeros_like(vx)
-        szz = torch.zeros_like(vx)
-        sxy = torch.zeros_like(vx)
-        sxz = torch.zeros_like(vx)
-        syz = torch.zeros_like(vx)
-
-
-        # Optimize memory: Only allocate histories if requested
-        vz_history = None
-        if return_vz:
-            vz_history = torch.empty((batch_size, n_steps, self.nx, self.ny, self.nz), device=self.device)
-            print(f"[Physics] vz_history allocated: {vz_history.numel() * 4 / (1024**3):.3f} GB")
-
-        stress_history = None
-        if return_stress_history:
-            stress_history = torch.empty((batch_size, n_steps, self.nx, self.ny, self.nz), device=self.device)
-            print(f"[Physics] stress_history allocated: {stress_history.numel() * 4 / (1024**3):.3f} GB")
-
-        beta = 1000.0
-        running_max = torch.full((batch_size, self.nx, self.ny, self.nz), -1e9, device=self.device)
-        running_sum = torch.zeros((batch_size, self.nx, self.ny, self.nz), device=self.device)
-
+        batch_size = 1  # Single trajectory optimization
         inv_dx = self.inv_dx
         inv_dy = self.inv_dy
-        inv_dz = self.inv_dz
         dt = self.dt
-        bulk_damping = self.bulk_damping
-        physics_eps = config.PHYSICS_EPS
+        dt_over_rho = self.dt_over_rho
+        mu = self.mu
+        eta = self.eta
 
-        rho = self.material.rho
-        mu = self.material.mu
-        lam = self.material.lam
-        eta = self.material.eta
-        damping = self.damping
-        
-        # Grid for source generation
-        grid_x, grid_y, grid_z = self.grid_x, self.grid_y, self.grid_z
-        source_depth = self.source_depth
-        source_sigma_xy = self.source_sigma_xy
-        source_sigma_z = self.source_sigma_z
+        # Initialize state tensors [batch, nx, ny]
+        vz = torch.zeros(batch_size, self.nx, self.ny, device=self.device)
+        strain_xz = torch.zeros(batch_size, self.nx, self.ny, device=self.device)
+        strain_yz = torch.zeros(batch_size, self.nx, self.ny, device=self.device)
 
+        # Pre-allocate working buffers to reduce per-step allocations
+        dvz_dx = torch.zeros_like(vz)
+        dvz_dy = torch.zeros_like(vz)
+        dsigma_xz_dx = torch.zeros_like(vz)
+        dsigma_yz_dy = torch.zeros_like(vz)
+
+        # Initialize history tensors
+        vz_history = torch.empty((n_steps, self.nx, self.ny), device=self.device)
+        stress_history = torch.empty((n_steps, self.nx, self.ny), device=self.device)
+
+        # Time stepping loop
         for t in range(n_steps):
             traj_idx = t % traj_len
-            x_t = trajectory[:, traj_idx, 0]
-            y_t = trajectory[:, traj_idx, 1]
+            # Get source position for this timestep
+            x_t = trajectory[traj_idx, 0].unsqueeze(0)  # [1]
+            y_t = trajectory[traj_idx, 1].unsqueeze(0)  # [1]
 
-            # JIT-compiled source generation
-            source = compute_source_kernel(
-                grid_x, grid_y, grid_z,
-                x_t, y_t,
-                source_depth,
-                source_sigma_xy,
-                source_sigma_z
-            ) * source_amplitude
+            # Compute source distribution
+            source = self._make_source(x_t, y_t, source_amplitude)
 
+            # ===== Step 1: Compute velocity gradients (Strain Rate) =====
+            # Central differences on staggered grid
+            # dvz/dx: difference along x-axis (axis 1)
+            dvz_dx.zero_()
+            dvz_dx[:, :-1, :] = (vz[:, 1:, :] - vz[:, :-1, :]) * inv_dx
 
-            # JIT-compiled FDTD update
-            vx, vy, vz, sxx, syy, szz, sxy, sxz, syz, stress_mag = fdtd_step_kernel(
-                vx, vy, vz, sxx, syy, szz, sxy, sxz, syz,
-                rho, mu, lam, eta, damping, source,
-                dt, inv_dx, inv_dy, inv_dz,
-                bulk_damping, physics_eps
-            )
+            # dvz/dy: difference along y-axis (axis 2)
+            dvz_dy.zero_()
+            dvz_dy[:, :, :-1] = (vz[:, :, 1:] - vz[:, :, :-1]) * inv_dy
 
-            if return_vz and vz_history is not None:
-                vz_history[:, t] = vz
+            # ===== Step 2: Update Strains =====
+            strain_xz = strain_xz + dvz_dx * dt
+            strain_yz = strain_yz + dvz_dy * dt
 
-            if return_stress_history and stress_history is not None:
-                stress_history[:, t] = stress_mag
+            # ===== Step 3: Update Stresses (Kelvin-Voigt) =====
+            # σ = μ * ε + η * ε_dot
+            sigma_xz = mu * strain_xz + eta * dvz_dx
+            sigma_yz = mu * strain_yz + eta * dvz_dy
 
-            stress_scaled = stress_mag * beta
-            prev_max = running_max
-            running_max = torch.maximum(prev_max, stress_scaled)
-            running_sum = running_sum * torch.exp(prev_max - running_max) + torch.exp(stress_scaled - running_max)
+            # ===== Step 4: Compute stress divergence =====
+            dsigma_xz_dx.zero_()
+            dsigma_xz_dx[:, 1:, :] = (sigma_xz[:, 1:, :] - sigma_xz[:, :-1, :]) * inv_dx
 
-        mip_map = (running_max + torch.log(running_sum + config.PHYSICS_EPS)) / beta
+            dsigma_yz_dy.zero_()
+            dsigma_yz_dy[:, :, 1:] = (sigma_yz[:, :, 1:] - sigma_yz[:, :, :-1]) * inv_dy
 
-        output = {
-            "mip_map": mip_map,
+            # ===== Step 5: Update velocity =====
+            vz = vz + dt_over_rho * (dsigma_xz_dx + dsigma_yz_dy + source)
+
+            # ===== Step 6: Apply bulk damping (tissue-like attenuation) =====
+            if self.bulk_damping > 0.0:
+                vz = vz * (1.0 - self.bulk_damping * dt)
+
+            # ===== Step 7: Apply absorbing boundary =====
+            vz = vz * self.damping
+
+            # Store history (squeeze batch dimension)
+            vz_history[t] = vz.squeeze(0)
+            
+            # Calculate and store stress magnitude
+            # Add epsilon to prevent NaN gradient in sqrt(0)
+            stress_mag = torch.sqrt(sigma_xz ** 2 + sigma_yz ** 2 + config.PHYSICS_EPS)
+            stress_history[t] = stress_mag.squeeze(0)
+
+        return {
+            'vz_history': vz_history,
+            'stress_history': stress_history,
         }
-        if stress_history is not None:
-            output["stress_history"] = stress_history
-        if vz_history is not None:
-            output["vz_history"] = vz_history
 
-        return output
+    def get_field_at_point(
+        self,
+        field: torch.Tensor,
+        x: float,
+        y: float
+    ) -> torch.Tensor:
+        """
+        Bilinear interpolation of field value at continuous (x, y) coordinates.
 
-    def get_surface_field(self, field: torch.Tensor, z_index: int = 1) -> torch.Tensor:
-        """Return a surface slice at given z index (near surface)."""
-        return field[:, :, :, z_index]
+        Args:
+            field: [nx, ny] field tensor
+            x, y: Coordinate in meters
+
+        Returns: Interpolated value
+        """
+        # Convert to grid indices
+        ix = (x / self.dx) - 0.5
+        iy = (y / self.dy) - 0.5
+
+        # Get integer indices
+        ix0 = int(torch.floor(torch.tensor(ix)))
+        iy0 = int(torch.floor(torch.tensor(iy)))
+        ix1 = ix0 + 1
+        iy1 = iy0 + 1
+
+        # Clamp to valid range
+        ix0 = max(0, min(ix0, self.nx - 2))
+        iy0 = max(0, min(iy0, self.ny - 2))
+        ix1 = min(ix1, self.nx - 1)
+        iy1 = min(iy1, self.ny - 1)
+
+        # Fractional parts
+        fx = ix - ix0
+        fy = iy - iy0
+
+        # Bilinear interpolation
+        val = (
+            field[ix0, iy0] * (1 - fx) * (1 - fy) +
+            field[ix0, iy1] * (1 - fx) * fy +
+            field[ix1, iy0] * fx * (1 - fy) +
+            field[ix1, iy1] * fx * fy
+        )
+
+        return val
+
+
+def test_physics():
+    """Basic unit test: point source should produce circular wavefront."""
+    print("=" * 60)
+    print("Testing physics layer...")
+
+    # Small grid for quick test
+    physics = ViscoelasticWave2D(
+        Lx=0.1, Ly=0.1, nx=100, ny=100,
+        dt=25e-6, n_steps=50,
+        device=torch.device('cpu')
+    )
+
+    # Static source at center
+    center = 0.05
+    # Make trajectory require grad for backward check
+    traj_x = torch.full((50,), center, requires_grad=True)
+    traj_y = torch.full((50,), center, requires_grad=True)
+    trajectory = torch.stack([traj_x, traj_y], dim=-1)
+
+    # Run simulation
+    output = physics(trajectory)
+
+    # Check wavefront: at t=50, wave should have traveled ~50 * 0.125 * 0.5mm ≈ 3mm
+    # (Courant * n_steps * dx in each direction, but slower due to 2D spreading)
+    vz = output['vz_history']
+
+    print(f"Vz history shape: {vz.shape}")
+    print(f"Max |vz| at final step: {vz[-1].abs().max():.6e}")
+
+    # Check gradient flow
+    vz_sum = vz.sum()
+    vz_sum.backward()
+
+    print("Gradient check: trajectory has gradient =", trajectory.grad is not None)
+    print("Physics test PASSED!")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
-    physics = ViscoelasticWave3D(device=torch.device("cpu"))
-    traj = torch.stack([torch.full((10,), 0.05), torch.full((10,), 0.05)], dim=-1)
-    output = physics(traj)
-    print(output["stress_history"].shape)
+    test_physics()

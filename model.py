@@ -131,16 +131,12 @@ class NeuralSplineTrajectory(nn.Module):
         control_points = torch.sigmoid(logits) * self.space_scale
         return control_points
 
-    def forward(self, batch_size: int = 1) -> torch.Tensor:
-        """Return [batch, n_steps, 2] trajectory in physical coordinates."""
-        latent = self.latent.unsqueeze(0).repeat(batch_size, 1)
-        offsets = self.mlp(latent).view(batch_size, self.n_control_points, 2)
-        logits = self.base_logits.unsqueeze(0) + offsets
-        control_points = torch.sigmoid(logits) * self.space_scale
-
-        selected = control_points[:, self.basis_indices]
-        weights = self.basis_weights.unsqueeze(0).unsqueeze(-1)
-        trajectory = (selected * weights).sum(dim=2)
+    def forward(self) -> torch.Tensor:
+        """Return [n_steps, 2] trajectory in physical coordinates."""
+        control_points = self._compute_control_points()
+        selected = control_points[self.basis_indices]
+        weights = self.basis_weights.unsqueeze(-1)
+        trajectory = (selected * weights).sum(dim=1)
         return trajectory
 
 

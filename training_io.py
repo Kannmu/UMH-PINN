@@ -40,14 +40,6 @@ def save_wave_gif(
     # Pre-fetch data to CPU
     stress_history = wave_output['stress_history'].detach().cpu().numpy()
     trajectory_np = trajectory.detach().cpu().numpy()
-    if stress_history.ndim == 5:
-        stress_history = stress_history[0]
-    if trajectory_np.ndim == 3:
-        trajectory_np = trajectory_np[0]
-    if stress_history.ndim == 4:
-        z_idx = config.VISUAL_CONFIG.get("z_slice_index", 1)
-        z_idx = min(max(int(z_idx), 0), stress_history.shape[3] - 1)
-        stress_history = stress_history[:, :, :, z_idx]
     stress_history = np.transpose(stress_history, (0, 2, 1))
     n_steps = stress_history.shape[0]
     traj_len = trajectory_np.shape[0]

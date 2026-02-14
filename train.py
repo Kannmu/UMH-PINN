@@ -15,7 +15,7 @@ from typing import Dict, Optional
 
 import config
 from device_utils import get_device, print_device_info
-from physics_layer import ViscoelasticWave3D
+from physics_layer import ViscoelasticWave2D
 from model import NeuralSplineTrajectory
 from loss import compute_loss
 from training_io import (
@@ -35,10 +35,8 @@ def train(
     loss_weights: Optional[Dict[str, float]] = None,
     save_interval: int = config.TRAIN_CONFIG["save_interval"],
     output_dir: str = config.TRAIN_CONFIG["output_dir"],
-    batch_size: int = config.TRAIN_CONFIG["batch_size"],
     device: Optional[torch.device] = None,
 ):
-
     """
     Main training loop.
 
@@ -77,18 +75,7 @@ def train(
     physics_params.pop("sim_cycles", None)
     physics_params["n_steps"] = model_params["n_steps"] * sim_cycles
     physics_params["device"] = device
-    physics = ViscoelasticWave3D(**physics_params)
-
-    if config.TRAIN_CONFIG.get("use_tf32", False) and device.type == "cuda":
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-
-    if config.TRAIN_CONFIG.get("compile", False):
-        print("Compiling model and physics with torch.compile... (This may take a while on first run)")
-        model = torch.compile(model)
-        print("Model compiled.")
-    else:
-        print("Running in eager mode (torch.compile disabled).")
+    physics = ViscoelasticWave2D(**physics_params)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
@@ -130,17 +117,8 @@ def train(
             optimizer.zero_grad()
 
             # Forward pass
-            # Only request full stress history on visualization steps
-            should_visualize = (epoch % save_interval == 0 or epoch == n_epochs - 1)
-            return_vz = False
-            return_stress_history = should_visualize
-            trajectory = model(batch_size=batch_size)
-
-            wave_output = physics(
-                trajectory,
-                return_vz=return_vz,
-                return_stress_history=return_stress_history,
-            )
+            trajectory = model()
+            wave_output = physics(trajectory)
 
             # Compute loss
             loss, loss_dict = compute_loss(
@@ -218,8 +196,6 @@ def train(
                     trajectory, epoch, output_dir, target_pos, loss_dict
                 )
             if epoch == n_epochs - 1:
-                # Ensure we have vz_history for the final GIF if needed, though gif only uses stress
-                # save_wave_gif uses 'stress_history' which is always returned
                 save_wave_gif(wave_output, trajectory, epoch, output_dir, target_pos)
     finally:
         if csv_file is not None:
@@ -286,7 +262,6 @@ def main():
         target_pos=(args.target_x, args.target_y),
         output_dir=args.output,
         save_interval=args.save_interval,
-        batch_size=config.TRAIN_CONFIG["batch_size"],
         device=device,
     )
 
