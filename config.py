@@ -45,7 +45,12 @@ LOSS_EPS = 1e-8
 PHYSICS_EPS = 1e-8
 
 VISUAL_CONFIG = {
-    "gif_fps": 20,
+    "video_fps": 20,
+    "video_codec": "libx264",
+    "video_bitrate": "2M",
+    "video_dpi": 120,
+    "video_frame_stride": 1,
+    "video_max_frames": None,
     "wave_figsize": (8, 8),
     "traj_figsize": (8, 8),
     "vmax_scale": 0.8,

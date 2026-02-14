@@ -14,17 +14,22 @@ import matplotlib.pyplot as plt
 import config
 
 
-def save_wave_gif(
+def save_wave_video_mp4(
     wave_output: Dict[str, torch.Tensor],
     trajectory: torch.Tensor,
     epoch: int,
     output_dir: str = config.TRAIN_CONFIG["output_dir"],
     target_pos: Optional[tuple] = None,
-    fps: int = config.VISUAL_CONFIG["gif_fps"],
+    fps: int = config.VISUAL_CONFIG["video_fps"],
+    codec: str = config.VISUAL_CONFIG["video_codec"],
+    bitrate: Optional[str] = config.VISUAL_CONFIG["video_bitrate"],
+    dpi: int = config.VISUAL_CONFIG["video_dpi"],
+    frame_stride: int = config.VISUAL_CONFIG["video_frame_stride"],
+    max_frames: Optional[int] = config.VISUAL_CONFIG["video_max_frames"],
 ):
     """
-    Create animated GIF of the wave field with trajectory overlay.
-    Optimized to reuse figure and axes for performance.
+    Create MP4 video of the wave field with trajectory overlay.
+    Optimized for performance and readability using an Agg canvas.
     """
     try:
         import imageio.v2 as imageio
@@ -32,16 +37,23 @@ def save_wave_gif(
         try:
             import imageio
         except ImportError:
-            print("imageio not installed, skipping GIF generation")
+            print("imageio not installed, skipping MP4 generation")
             return
 
     os.makedirs(output_dir, exist_ok=True)
 
     # Pre-fetch data to CPU
-    stress_history = wave_output['stress_history'].detach().cpu().numpy()
+    stress_history = wave_output["stress_history"].detach().cpu().numpy()
     trajectory_np = trajectory.detach().cpu().numpy()
     stress_history = np.transpose(stress_history, (0, 2, 1))
     n_steps = stress_history.shape[0]
+
+    # Build frame indices with optional stride/limit
+    frame_indices = np.arange(0, n_steps, max(1, frame_stride))
+    if max_frames is not None and len(frame_indices) > max_frames:
+        frame_indices = np.linspace(0, n_steps - 1, max_frames).astype(int)
+
+    # Expand trajectory to cover all frames
     traj_len = trajectory_np.shape[0]
     repeats = int(np.ceil(n_steps / traj_len))
     trajectory_full = np.tile(trajectory_np, (repeats, 1))[:n_steps]
@@ -55,77 +67,67 @@ def save_wave_gif(
         data_max = data_min + 1e-12
 
     # Setup Figure (Create once, reuse for all frames)
-    # Using 'Agg' backend context if possible is better, but here we just reuse fig
-    fig, ax = plt.subplots(figsize=config.VISUAL_CONFIG["wave_figsize"])
+    fig, ax = plt.subplots(figsize=config.VISUAL_CONFIG["wave_figsize"], dpi=dpi)
+    from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+    canvas = FigureCanvas(fig)
 
     # Initial Image Plot (Step 0)
     im = ax.imshow(
         stress_history[0],
-        origin='lower',
+        origin="lower",
         extent=[0, Lx * config.VISUAL_CONFIG["cm_scale"], 0, Ly * config.VISUAL_CONFIG["cm_scale"]],
-        cmap='RdBu_r',
+        cmap="RdBu_r",
         vmin=data_min,
         vmax=data_max,
-        interpolation='nearest'  # Fast interpolation
+        interpolation="nearest",
     )
 
     # Initial Plot Elements (Empty data initially)
-    # Trajectory line
-    traj_line, = ax.plot([], [], 'k-', linewidth=1, alpha=0.5, label='Trajectory')
-
-    # Current Focus Point
-    focus_point, = ax.plot([], [], 'go', markersize=8, label='Current focus')
+    traj_line, = ax.plot([], [], "k-", linewidth=1, alpha=0.5, label="Trajectory")
+    focus_point, = ax.plot([], [], "go", markersize=8, label="Current focus")
 
     # Target Point (Static, draw once)
     if target_pos:
         ax.plot(
             target_pos[0] * config.VISUAL_CONFIG["cm_scale"],
             target_pos[1] * config.VISUAL_CONFIG["cm_scale"],
-            'r*',
+            "r*",
             markersize=15,
-            label='Target'
+            label="Target",
         )
 
     # Static Formatting
-    ax.set_xlabel('X (cm)')
-    ax.set_ylabel('Y (cm)')
-    ax.legend(loc='upper right')
+    ax.set_xlabel("X (cm)")
+    ax.set_ylabel("Y (cm)")
+    ax.legend(loc="upper right")
     ax.set_xlim(0, Lx * config.VISUAL_CONFIG["cm_scale"])
     ax.set_ylim(0, Ly * config.VISUAL_CONFIG["cm_scale"])
-    fig.colorbar(im, ax=ax, label='Shear Stress (Pa)')
+    fig.colorbar(im, ax=ax, label="Shear Stress (Pa)")
 
-    # Loop through time steps
-    gif_path = os.path.join(output_dir, f'wave_epoch_{epoch:04d}.gif')
-    with imageio.get_writer(gif_path, mode='I', fps=fps) as writer:
-        for t in range(n_steps):
+    video_path = os.path.join(output_dir, f"wave_epoch_{epoch:04d}.mp4")
+    writer_kwargs = {
+        "fps": fps,
+        "codec": codec,
+        "format": "ffmpeg",
+    }
+    if bitrate:
+        writer_kwargs["bitrate"] = bitrate
+
+    with imageio.get_writer(video_path, **writer_kwargs) as writer:
+        for t in frame_indices:
             im.set_data(stress_history[t])
             traj_line.set_data(trajectory_cm[:t + 1, 0], trajectory_cm[:t + 1, 1])
             focus_point.set_data([trajectory_cm[t, 0]], [trajectory_cm[t, 1]])
-            ax.set_title(f'Shear Stress Field - Step {t}/{n_steps}')
-            fig.canvas.draw()
+            ax.set_title(f"Shear Stress Field - Step {t + 1}/{n_steps}")
+            canvas.draw()
 
-            if hasattr(fig.canvas, 'buffer_rgba'):
-                frame = np.asarray(fig.canvas.buffer_rgba(), dtype=np.uint8)
-            elif hasattr(fig.canvas, 'tostring_rgb'):
-                frame = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-                frame = frame.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-            else:
-                frame = np.array(fig.canvas.renderer.buffer_rgba())
-
-            if frame.ndim == 1:
-                w, h = fig.canvas.get_width_height()
-                if frame.size == w * h * 4:
-                    frame = frame.reshape((h, w, 4))
-                elif frame.size == w * h * 3:
-                    frame = frame.reshape((h, w, 3))
-
+            frame = np.asarray(canvas.buffer_rgba(), dtype=np.uint8)
             if frame.shape[2] == 4:
                 frame = frame[:, :, :3]
-
-            writer.append_data(frame.copy())
+            writer.append_data(frame)
 
     plt.close(fig)
-    print(f"Saved: {gif_path}")
+    print(f"Saved: {video_path}")
 
 
 def save_trajectory_plot(

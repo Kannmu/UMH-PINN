@@ -19,7 +19,7 @@ from physics_layer import ViscoelasticWave2D
 from model import NeuralSplineTrajectory
 from loss import compute_loss
 from training_io import (
-    save_wave_gif,
+    save_wave_video_mp4,
     save_trajectory_plot,
     plot_training_history,
     setup_training_logger,
@@ -196,7 +196,7 @@ def train(
                     trajectory, epoch, output_dir, target_pos, loss_dict
                 )
             if epoch == n_epochs - 1:
-                save_wave_gif(wave_output, trajectory, epoch, output_dir, target_pos)
+                save_wave_video_mp4(wave_output, trajectory, epoch, output_dir, target_pos)
     finally:
         if csv_file is not None:
             csv_file.close()
